@@ -55,17 +55,28 @@ defmodule Bamboo.SMTPAdapter do
       message = """
       There was a problem sending the email through SMTP.
 
-      The error is #{inspect(reason)}
+      The error is #{inspect reason}
 
       More detail below:
 
-      #{inspect(detail)}
+      #{inspect detail}
       """
 
       %SMTPError{message: message, raw: raw}
     end
   end
 
+  def deliver(email, config, inline_image_id) do
+    gen_smtp_config =
+      config
+      |> to_gen_smtp_server_config
+
+    email
+    |> Bamboo.Mailer.normalize_addresses
+    |> to_gen_smtp_message(inline_image_id)
+    |> config[:transport].send_blocking(gen_smtp_config)
+    |> handle_response
+  end
   def deliver(email, config) do
     gen_smtp_config =
       config
@@ -88,14 +99,9 @@ defmodule Bamboo.SMTPAdapter do
   @doc false
   def supports_attachments?, do: true
 
-  defp handle_response({:error, :no_credentials = reason}) do
-    raise SMTPError, {reason, "Username and password were not provided for authentication."}
-  end
-
   defp handle_response({:error, reason, detail}) do
     raise SMTPError, {reason, detail}
   end
-
   defp handle_response(_) do
     :ok
   end
@@ -191,6 +197,15 @@ defmodule Bamboo.SMTPAdapter do
     |> add_smtp_line(text_body)
   end
 
+  #extra function for inline images
+  defp add_attachment_header(body, attachment, inline_image_id) do
+    body
+    |> add_smtp_line("Content-Type: #{attachment.content_type}; name=\"#{attachment.filename}\"")
+    |> add_smtp_line("Content-Disposition: attachment; filename=\"#{attachment.filename}\"")
+    |> add_smtp_line("Content-Transfer-Encoding: base64")
+    |> add_smtp_line("X-Attachment-Id: #{inline_image_id}")
+    |> add_smtp_line("Content-ID: <#{inline_image_id}>")
+  end
   defp add_attachment_header(body, attachment) do
     << random :: size(32) >> = :crypto.strong_rand_bytes(4)
     body
@@ -211,6 +226,13 @@ defmodule Bamboo.SMTPAdapter do
   end
 
   defp add_attachment(nil, _), do: ""
+  defp add_attachment(attachment, multi_part_mixed_delimiter, inline_image_id) do
+    ""
+    |> add_multipart_delimiter(multi_part_mixed_delimiter)
+    |> add_attachment_header(attachment, inline_image_id)
+    |> add_smtp_line("")
+    |> add_attachment_body(attachment.data)
+  end
   defp add_attachment(attachment, multi_part_mixed_delimiter) do
     ""
     |> add_multipart_delimiter(multi_part_mixed_delimiter)
@@ -220,6 +242,11 @@ defmodule Bamboo.SMTPAdapter do
   end
 
   defp add_attachments(body, %Bamboo.Email{attachments: nil}, _), do: body
+  defp add_attachments(body, %Bamboo.Email{attachments: attachments}, multi_part_mixed_delimiter, inline_image_id) do
+    attachment_part =
+      attachments |> Enum.map(fn(attachment) -> add_attachment(attachment, multi_part_mixed_delimiter, inline_image_id) end)
+    "#{body}#{attachment_part}"
+  end
   defp add_attachments(body, %Bamboo.Email{attachments: attachments}, multi_part_mixed_delimiter) do
     attachment_part =
       attachments |> Enum.map(fn(attachment) -> add_attachment(attachment, multi_part_mixed_delimiter) end)
@@ -248,6 +275,29 @@ defmodule Bamboo.SMTPAdapter do
     "----=_Part_#{random1}_#{random2}.#{random3}"
   end
 
+  #extra function for inline image
+  defp body(email = %Bamboo.Email{}, inline_image_id) do
+    multi_part_delimiter = generate_multi_part_delimiter()
+    multi_part_mixed_delimiter = generate_multi_part_delimiter()
+    ""
+    |> add_subject(email)
+    |> add_from(email)
+    |> add_bcc(email)
+    |> add_cc(email)
+    |> add_to(email)
+    |> add_custom_headers(email)
+    |> add_mime_header
+    |> add_multipart_mixed_header(multi_part_mixed_delimiter)
+    |> add_ending_header
+    |> add_multipart_delimiter(multi_part_mixed_delimiter)
+    |> add_multipart_header(multi_part_delimiter)
+    |> add_ending_header
+    |> add_text_body(email, multi_part_delimiter)
+    |> add_html_body(email, multi_part_delimiter)
+    |> add_ending_multipart(multi_part_delimiter)
+    |> add_attachments(email, multi_part_mixed_delimiter, inline_image_id)
+    |> add_ending_multipart(multi_part_mixed_delimiter)
+  end
   defp body(email = %Bamboo.Email{}) do
     multi_part_delimiter = generate_multi_part_delimiter()
     multi_part_mixed_delimiter = generate_multi_part_delimiter()
@@ -348,6 +398,9 @@ defmodule Bamboo.SMTPAdapter do
     |> format_email(:to, false)
   end
 
+  defp to_gen_smtp_message(email = %Bamboo.Email{}, inline_image_id) do
+    {from_without_format(email), to_without_format(email), body(email, inline_image_id)}
+  end
   defp to_gen_smtp_message(email = %Bamboo.Email{}) do
     {from_without_format(email), to_without_format(email), body(email)}
   end
